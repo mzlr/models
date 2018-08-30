@@ -45,19 +45,21 @@ def bytes_feature(values):
   """Returns a TF-Feature of bytes.
 
   Args:
-    values: A string.
+    values: A string or list of values.
 
   Returns:
     A TF-Feature.
   """
-  return tf.train.Feature(bytes_list=tf.train.BytesList(value=[values]))
+  if not isinstance(values, (tuple, list)):
+    values = [values]
+  return tf.train.Feature(bytes_list=tf.train.BytesList(value=values))
 
 
 def float_feature(values):
   """Returns a TF-Feature of floats.
 
   Args:
-    values: A scalar of list of values.
+    values: A scalar or list of values.
 
   Returns:
     A TF-Feature.
