@@ -73,6 +73,7 @@ def get_preprocessing(name, is_training=False):
       'vgg_a': vgg_preprocessing,
       'vgg_16': vgg_preprocessing,
       'vgg_19': vgg_preprocessing,
+      'i3d': i3d_preprocessing,
   }
 
   if name not in preprocessing_fn_map:
