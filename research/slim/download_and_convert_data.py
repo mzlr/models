@@ -39,6 +39,8 @@ import tensorflow as tf
 from datasets import download_and_convert_cifar10
 from datasets import download_and_convert_flowers
 from datasets import download_and_convert_mnist
+from datasets import download_and_convert_20bn
+from datasets import download_and_convert_kinetics
 
 FLAGS = tf.app.flags.FLAGS
 
@@ -50,6 +52,11 @@ tf.app.flags.DEFINE_string(
 tf.app.flags.DEFINE_string(
     'dataset_dir',
     None,
+    'The directory where the raw files are saved.')
+    
+tf.app.flags.DEFINE_string(
+    'dataset_output',
+    None,
     'The directory where the output TFRecords and temporary files are saved.')
 
 
@@ -58,6 +65,9 @@ def main(_):
     raise ValueError('You must supply the dataset name with --dataset_name')
   if not FLAGS.dataset_dir:
     raise ValueError('You must supply the dataset directory with --dataset_dir')
+  if not FLAGS.dataset_output:
+    raise ValueError('You must supply the output dataset directory with --dataset_output')
+
 
   if FLAGS.dataset_name == 'cifar10':
     download_and_convert_cifar10.run(FLAGS.dataset_dir)
@@ -65,6 +75,10 @@ def main(_):
     download_and_convert_flowers.run(FLAGS.dataset_dir)
   elif FLAGS.dataset_name == 'mnist':
     download_and_convert_mnist.run(FLAGS.dataset_dir)
+  elif FLAGS.dataset_name == '20bn':
+    download_and_convert_20bn.run(FLAGS.dataset_dir, FLAGS.dataset_output)
+  elif FLAGS.dataset_name == 'kinetics':
+    download_and_convert_kinetics.run(FLAGS.dataset_dir, FLAGS.dataset_output)
   else:
     raise ValueError(
         'dataset_name [%s] was not recognized.' % FLAGS.dataset_name)
