@@ -25,6 +25,11 @@ from deployment import model_deploy
 from nets import nets_factory
 from preprocessing import preprocessing_factory
 
+from nets import i3d
+from nets import i3d_last
+from nets import lstm
+from preprocessing import i3d_preprocessing
+
 slim = tf.contrib.slim
 
 tf.app.flags.DEFINE_string(
@@ -416,65 +421,105 @@ def main(_):
     ######################
     # Select the network #
     ######################
-    network_fn = nets_factory.get_network_fn(
-        FLAGS.model_name,
-        num_classes=(dataset.num_classes - FLAGS.labels_offset),
-        weight_decay=FLAGS.weight_decay,
-        is_training=True)
+    network_fn_rgb = i3d.InceptionI3d(
+      dataset.num_classes, spatial_squeeze=True,
+      final_endpoint='Mixed_5c', name='RGB/inception_i3d')
+
+    network_fn_opt = i3d.InceptionI3d(
+      dataset.num_classes, spatial_squeeze=True,
+      final_endpoint='Mixed_5c', name='OPT/inception_i3d')
+
+    network_fn_fusion = i3d_last.InceptionI3d(
+      dataset.num_classes, spatial_squeeze=True,
+      final_endpoint='Logits', name='Fusion')
 
     #####################################
     # Select the preprocessing function #
     #####################################
-    preprocessing_name = FLAGS.preprocessing_name or FLAGS.model_name
-    image_preprocessing_fn = preprocessing_factory.get_preprocessing(
-        preprocessing_name,
-        is_training=True)
 
     ##############################################################
     # Create a dataset provider that loads data from the dataset #
     ##############################################################
     with tf.device(deploy_config.inputs_device()):
       provider = slim.dataset_data_provider.DatasetDataProvider(
-          dataset,
-          num_readers=FLAGS.num_readers,
-          common_queue_capacity=20 * FLAGS.batch_size,
-          common_queue_min=10 * FLAGS.batch_size)
-      [image, label] = provider.get(['image', 'label'])
+        dataset,
+        num_readers=FLAGS.num_readers,
+        common_queue_capacity=20 * FLAGS.batch_size,
+        common_queue_min=10 * FLAGS.batch_size)
+      [rgb, opt, label, height, width] = provider.get(
+        ['RGB', 'OPT', 'label', 'height', 'width'])
+      opt = tf.map_fn(lambda x: tf.reshape(x, tf.stack([height, width, 2])),
+                      opt, dtype=tf.float32)
+
       label -= FLAGS.labels_offset
 
-      train_image_size = FLAGS.train_image_size or network_fn.default_image_size
+      rgb, opt = i3d_preprocessing.preprocess_rgb_opt(rgb, opt,
+                                                      is_training=True)
 
-      image = image_preprocessing_fn(image, train_image_size, train_image_size)
-
-      images, labels = tf.train.batch(
-          [image, label],
-          batch_size=FLAGS.batch_size,
-          num_threads=FLAGS.num_preprocessing_threads,
-          capacity=5 * FLAGS.batch_size)
-      labels = slim.one_hot_encoding(
-          labels, dataset.num_classes - FLAGS.labels_offset)
+      rgbs, opts, labels = tf.train.batch(
+        [rgb, opt, label],
+        shapes=[[50, 224, 224, 3], [50, 224, 224, 2], []],
+        batch_size=FLAGS.batch_size,
+        num_threads=FLAGS.num_preprocessing_threads,
+        capacity=5 * FLAGS.batch_size)
+      # labels = slim.one_hot_encoding(
+      #     labels, dataset.num_classes - FLAGS.labels_offset)
       batch_queue = slim.prefetch_queue.prefetch_queue(
-          [images, labels], capacity=2 * deploy_config.num_clones)
+        [rgbs, opts, labels], capacity=2 * deploy_config.num_clones)
 
     ####################
     # Define the model #
     ####################
     def clone_fn(batch_queue):
       """Allows data parallelism by creating multiple clones of network_fn."""
-      images, labels = batch_queue.dequeue()
-      logits, end_points = network_fn(images)
+      rgbs, opts, labels = batch_queue.dequeue()
+
+      logits_rgb, _ = network_fn_rgb(
+        rgbs, is_training=True, dropout_keep_prob=0.5)
+
+      logits_opt, _ = network_fn_opt(
+        opts, is_training=True, dropout_keep_prob=0.5)
+
+      losses, logits = lstm.lstm(logits_rgb,
+                                 logits_opt,
+                                 labels=labels,
+                                 is_training=True,
+                                 dropout_keep_prob=0.5)
+
+      logits, _ = network_fn_fusion(
+        logits,
+        is_training=True,
+        dropout_keep_prob=0.5)
+
+      # Add model variables
+      for var in tf.global_variables(scope='RGB'):
+        slim.add_model_variable(var)
+      for var in tf.global_variables(scope='OPT'):
+        slim.add_model_variable(var)
+      for var in tf.global_variables(scope='Fusion'):
+        slim.add_model_variable(var)
+      for var in tf.global_variables(scope='LSTM'):
+        slim.add_model_variable(var)
+
+      tf.losses.add_loss(tf.multiply(losses, 0.6, name='weighted_lstm_loss'))
+
+      labels = slim.one_hot_encoding(
+        labels, dataset.num_classes - FLAGS.labels_offset)
+      slim.losses.softmax_cross_entropy(
+        logits, labels,
+        label_smoothing=FLAGS.label_smoothing, weights=1, scope='fused_loss')
 
       #############################
       # Specify the loss function #
       #############################
-      if 'AuxLogits' in end_points:
-        slim.losses.softmax_cross_entropy(
-            end_points['AuxLogits'], labels,
-            label_smoothing=FLAGS.label_smoothing, weights=0.4,
-            scope='aux_loss')
-      slim.losses.softmax_cross_entropy(
-          logits, labels, label_smoothing=FLAGS.label_smoothing, weights=1.0)
-      return end_points
+      # if 'AuxLogits' in end_points:
+      #     slim.losses.softmax_cross_entropy(
+      #         end_points['AuxLogits'], labels,
+      #         label_smoothing=FLAGS.label_smoothing, weights=0.4,
+      #         scope='aux_loss')
+      # slim.losses.softmax_cross_entropy(
+      #     logits, labels, label_smoothing=FLAGS.label_smoothing, weights=1)
+      # return end_points_RGB, end_points_OPT
 
     # Gather initial summaries.
     summaries = set(tf.get_collection(tf.GraphKeys.SUMMARIES))
@@ -485,13 +530,13 @@ def main(_):
     # the updates for the batch_norm variables created by network_fn.
     update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS, first_clone_scope)
 
-    # Add summaries for end_points.
-    end_points = clones[0].outputs
-    for end_point in end_points:
-      x = end_points[end_point]
-      summaries.add(tf.summary.histogram('activations/' + end_point, x))
-      summaries.add(tf.summary.scalar('sparsity/' + end_point,
-                                      tf.nn.zero_fraction(x)))
+    # # Add summaries for end_points.
+    # end_points = clones[0].outputs
+    # for end_point in end_points:
+    #     x = end_points[end_point]
+    #     summaries.add(tf.summary.histogram('activations/' + end_point, x))
+    #     summaries.add(tf.summary.scalar('sparsity/' + end_point,
+    #                                     tf.nn.zero_fraction(x)))
 
     # Add summaries for losses.
     for loss in tf.get_collection(tf.GraphKeys.LOSSES, first_clone_scope):
@@ -543,8 +588,19 @@ def main(_):
     # Add total_loss to summary.
     summaries.add(tf.summary.scalar('total_loss', total_loss))
 
+    # Perform gradient clipping for LSTM
+    gradients_variables = [list(t) for t in zip(*clones_gradients)]
+    lstm_list = []
+    for i, var in enumerate(gradients_variables[1]):
+      if var.op.name.startswith('LSTM'):
+        lstm_list.append(i)
+    clipped_gradients, _ = tf.clip_by_global_norm(
+      [gradients_variables[0][i] for i in lstm_list], 5)
+    for i, gra in enumerate(clipped_gradients):
+      gradients_variables[0][lstm_list[i]] = gra
+
     # Create gradient updates.
-    grad_updates = optimizer.apply_gradients(clones_gradients,
+    grad_updates = optimizer.apply_gradients(zip(gradients_variables[0], gradients_variables[1]),
                                              global_step=global_step)
     update_ops.append(grad_updates)
 
@@ -574,6 +630,7 @@ def main(_):
         log_every_n_steps=FLAGS.log_every_n_steps,
         save_summaries_secs=FLAGS.save_summaries_secs,
         save_interval_secs=FLAGS.save_interval_secs,
+        session_config=tf.ConfigProto(allow_soft_placement=True),
         sync_optimizer=optimizer if FLAGS.sync_replicas else None)
 
 
