@@ -152,7 +152,6 @@ def main(_):
     ####################
     # Define the model #
     ####################
-<<<<<<< HEAD
     logits_rgb, _ = network_fn_rgb(
       rgbs, is_training=False)
 
@@ -180,7 +179,6 @@ def main(_):
     predictions_c = tf.argmax(logits_fused, axis=1)
     predictions_l = tf.argmin(logits_lstm, axis=1)
     predictions_f = tf.argmax(logits_lstm_sm + logits_fused_sm, axis=1)
-=======
     logits, _ = network_fn(images)
 
     if FLAGS.quantize:
@@ -197,7 +195,6 @@ def main(_):
 
     predictions = tf.argmax(logits, 1)
     labels = tf.squeeze(labels)
->>>>>>> f505cecde2d8ebf6fe15f40fb8bc350b2b1ed5dc
 
     # Define the metrics:
     names_to_values, names_to_updates = slim.metrics.aggregate_metric_map({
