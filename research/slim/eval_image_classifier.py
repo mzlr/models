@@ -26,8 +26,6 @@ from nets import nets_factory
 from preprocessing import preprocessing_factory
 
 from nets import i3d
-from nets import i3d_last
-from nets import lstm
 from preprocessing import i3d_preprocessing
 
 slim = tf.contrib.slim
@@ -96,7 +94,7 @@ def main(_):
 
   tf.logging.set_verbosity(tf.logging.INFO)
   with tf.Graph().as_default():
-    # tf_global_step = slim.get_or_create_global_step()
+    tf_global_step = slim.get_or_create_global_step()
 
     ######################
     # Select the dataset #
@@ -107,17 +105,9 @@ def main(_):
     ####################
     # Select the model #
     ####################
-    network_fn_rgb = i3d.InceptionI3d(
-      dataset.num_classes, spatial_squeeze=True,
-      final_endpoint='Mixed_5c', name='RGB/inception_i3d')
-
-    network_fn_opt = i3d.InceptionI3d(
-      dataset.num_classes, spatial_squeeze=True,
-      final_endpoint='Mixed_5c', name='OPT/inception_i3d')
-
-    network_fn_fusion = i3d_last.InceptionI3d(
-      dataset.num_classes, spatial_squeeze=True,
-      name='Fusion')
+    network_fn = i3d.InceptionI3d(
+      num_classes=(dataset.num_classes - FLAGS.labels_offset),
+      spatial_squeeze=True)
 
     ##############################################################
     # Create a dataset provider that loads data from the dataset #
@@ -128,22 +118,19 @@ def main(_):
         common_queue_capacity=20 * FLAGS.batch_size,
         common_queue_min=FLAGS.batch_size)
 
-    [rgb, opt, label, height, width] = provider.get(
-      ['RGB', 'OPT', 'label', 'height', 'width'])
-    opt = tf.map_fn(lambda x: tf.reshape(x, tf.stack([height, width, 2])),
-                    opt, dtype=tf.float32)
+    [img, label, name] = provider.get(
+      ['img', 'label', 'id'])
 
     label -= FLAGS.labels_offset
 
     #####################################
     # Select the preprocessing function #
     #####################################
-    rgb, opt = i3d_preprocessing.preprocess_rgb_opt(rgb, opt,
-                                                    is_training=False)
+    img = i3d_preprocessing.preprocess_rgb(img, is_training=False)
 
-    rgbs, opts, labels = tf.train.batch(
-        [rgb, opt, label],
-        shapes=[[None, 224, 224, 3], [None, 224, 224, 2], []],
+    imgs, labels, names = tf.train.batch(
+        [img, label, name],
+        shapes=[[None, 224, 224, 3], [], []],
         dynamic_pad=True,
         batch_size=FLAGS.batch_size,
         num_threads=FLAGS.num_preprocessing_threads,
@@ -152,34 +139,7 @@ def main(_):
     ####################
     # Define the model #
     ####################
-    logits_rgb, _ = network_fn_rgb(
-      rgbs, is_training=False)
-
-    logits_opt, _ = network_fn_opt(
-      opts, is_training=False)
-
-    logits_lstm, logits = lstm.lstm(logits_rgb, logits_opt, is_training=False)
-    logits_lstm = tf.expand_dims(logits_lstm, axis=0)
-    logits_lstm.set_shape([1, dataset.num_classes])
-    logits_lstm_sm = tf.nn.softmax(-1 * logits_lstm)
-
-    logits_fused, _ = network_fn_fusion(logits, is_training=False)
-    logits_fused_sm = tf.nn.softmax(logits_fused)
-
-    variables_to_restore = slim.get_variables_to_restore()
-    # if FLAGS.moving_average_decay:
-    #   variable_averages = tf.train.ExponentialMovingAverage(
-    #       FLAGS.moving_average_decay, tf_global_step)
-    #   variables_to_restore = variable_averages.variables_to_restore(
-    #       slim.get_model_variables())
-    #   variables_to_restore[tf_global_step.op.name] = tf_global_step
-    # else:
-    #   variables_to_restore = slim.get_variables_to_restore()
-
-    predictions_c = tf.argmax(logits_fused, axis=1)
-    predictions_l = tf.argmin(logits_lstm, axis=1)
-    predictions_f = tf.argmax(logits_lstm_sm + logits_fused_sm, axis=1)
-    logits, _ = network_fn(images)
+    logits, _ = network_fn(imgs, is_training=False)
 
     if FLAGS.quantize:
       tf.contrib.quantize.create_eval_graph()
@@ -194,15 +154,12 @@ def main(_):
       variables_to_restore = slim.get_variables_to_restore()
 
     predictions = tf.argmax(logits, 1)
-    labels = tf.squeeze(labels)
 
     # Define the metrics:
     names_to_values, names_to_updates = slim.metrics.aggregate_metric_map({
-      'Accuracy_Video': slim.metrics.streaming_accuracy(predictions_c, labels),
-      'Accuracy_LSTM': slim.metrics.streaming_accuracy(predictions_l, labels),
-      'Accuracy_Fused': slim.metrics.streaming_accuracy(predictions_f, labels),
-      # 'Recall_5': slim.metrics.streaming_recall_at_k(
-      #     logits_fused, labels, 5),
+      'Accuracy_Video': slim.metrics.streaming_accuracy(predictions, labels),
+      'Recall_5': slim.metrics.streaming_recall_at_k(
+          logits, labels, 5),
       # 'LSTM': slim.metrics.streaming_concat(logits_lstm),
       # 'Fused': slim.metrics.streaming_concat(logits_fused),
       # 'Labels': slim.metrics.streaming_concat(labels),
